@@ -1,15 +1,15 @@
-import os
 import re
 from rich.console import Console
 from rich.panel import Panel
 from datetime import datetime
 import json
+import time
 
 # Set up the Groq API client
-from groq import Groq
+from groq import Groq, RateLimitError
 import os
 
-client = Groq(api_key="YOUR API KEY")
+client = Groq(api_key="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")
 
 # Define the models to use for each agent
 ORCHESTRATOR_MODEL = "mixtral-8x7b-32768"
@@ -19,11 +19,14 @@ REFINER_MODEL = "llama3-70b-8192"
 # Initialize the Rich Console
 console = Console()
 
+
 def opus_orchestrator(objective, file_content=None, previous_results=None):
     console.print(f"\n[bold]Calling Orchestrator for your objective[/bold]")
     previous_results_text = "\n".join(previous_results) if previous_results else "None"
     if file_content:
-        console.print(Panel(f"File content:\n{file_content}", title="[bold blue]File Content[/bold blue]", title_align="left", border_style="blue"))
+        console.print(
+            Panel(f"File content:\n{file_content}", title="[bold blue]File Content[/bold blue]", title_align="left",
+                  border_style="blue"))
     messages = [
         {
             "role": "system",
@@ -31,7 +34,8 @@ def opus_orchestrator(objective, file_content=None, previous_results=None):
         },
         {
             "role": "user",
-            "content": f"Based on the following objective{' and file content' if file_content else ''}, and the previous sub-task results (if any), please break down the objective into the next sub-task, and create a concise and detailed prompt for a subagent so it can execute that task. IMPORTANT!!! when dealing with code tasks make sure you check the code for errors and provide fixes and support as part of the next sub-task. If you find any bugs or have suggestions for better code, please include them in the next sub-task prompt. Please assess if the objective has been fully achieved. If the previous sub-task results comprehensively address all aspects of the objective, include the phrase 'The task is complete:' at the beginning of your response. If the objective is not yet fully achieved, break it down into the next sub-task and create a concise and detailed prompt for a subagent to execute that task.:\n\nObjective: {objective}" + ('\\nFile content:\\n' + file_content if file_content else '') + f"\n\nPrevious sub-task results:\n{previous_results_text}"
+            "content": f"Based on the following objective{' and file content' if file_content else ''}, and the previous sub-task results (if any), please break down the objective into the next sub-task, and create a concise and detailed prompt for a subagent so it can execute that task. IMPORTANT!!! when dealing with code tasks make sure you check the code for errors and provide fixes and support as part of the next sub-task. If you find any bugs or have suggestions for better code, please include them in the next sub-task prompt. Please assess if the objective has been fully achieved. If the previous sub-task results comprehensively address all aspects of the objective, include the phrase 'The task is complete:' at the beginning of your response. If the objective is not yet fully achieved, break it down into the next sub-task and create a concise and detailed prompt for a subagent to execute that task.:\n\nObjective: {objective}" + (
+                '\\nFile content:\\n' + file_content if file_content else '') + f"\n\nPrevious sub-task results:\n{previous_results_text}"
         }
     ]
 
@@ -42,15 +46,19 @@ def opus_orchestrator(objective, file_content=None, previous_results=None):
     )
 
     response_text = opus_response.choices[0].message.content
-    console.print(Panel(response_text, title=f"[bold green]Groq Orchestrator[/bold green]", title_align="left", border_style="green", subtitle="Sending task to Subagent 👇"))
+    console.print(Panel(response_text, title=f"[bold green]Groq Orchestrator[/bold green]", title_align="left",
+                        border_style="green", subtitle="Sending task to Subagent 👇"))
     return response_text, file_content
+
 
 def haiku_sub_agent(prompt, previous_haiku_tasks=None, continuation=False):
     if previous_haiku_tasks is None:
         previous_haiku_tasks = []
 
+
     continuation_prompt = "Continuing from the previous answer, please complete the response."
-    system_message = "Previous Haiku tasks:\n" + "\n".join(f"Task: {task['task']}\nResult: {task['result']}" for task in previous_haiku_tasks)
+    system_message = "Previous Haiku tasks:\n" + "\n".join(
+        f"Task: {task['task']}\nResult: {task['result']}" for task in previous_haiku_tasks)
     if continuation:
         prompt = continuation_prompt
 
@@ -65,15 +73,35 @@ def haiku_sub_agent(prompt, previous_haiku_tasks=None, continuation=False):
         }
     ]
 
-    haiku_response = client.chat.completions.create(
-        model=SUB_AGENT_MODEL,
-        messages=messages,
-        max_tokens=8000
-    )
+    while True:
+        try:
+            haiku_response = client.chat.completions.create(
+                model=SUB_AGENT_MODEL,
+                messages=messages,
+                max_tokens=8000
+            )
+            response_text = haiku_response.choices[0].message.content
+            console.print(Panel(response_text, title="[bold blue]Groq Sub-agent Result[/bold blue]", title_align="left",
+                                border_style="blue", subtitle="Task completed, sending result to Orchestrator 👇"))
+            return response_text
+        except RateLimitError as e:
+            error_message = str(e)
+            wait_time_match = re.search(r'Please try again in (\d+)m([\d.]+)s', error_message)
+            if wait_time_match:
+                minutes = int(wait_time_match.group(1))
+                seconds = float(wait_time_match.group(2))
+                wait_time = minutes * 60 + seconds
+                console.print(
+                    f"[bold yellow]Rate limit reached. Waiting for {wait_time:.2f} seconds before retrying.[/bold yellow]")
+                time.sleep(wait_time)
+            else:
+                console.print(
+                    "[bold red]Rate limit error occurred, but couldn't parse wait time. Waiting for 60 seconds.[/bold red]")
+                time.sleep(60)
+        except Exception as e:
+            console.print(f"[bold red]An error occurred: {str(e)}. Retrying in 5 seconds.[/bold red]")
+            time.sleep(5)
 
-    response_text = haiku_response.choices[0].message.content
-    console.print(Panel(response_text, title="[bold blue]Groq Sub-agent Result[/bold blue]", title_align="left", border_style="blue", subtitle="Task completed, sending result to Orchestrator 👇"))
-    return response_text
 
 def opus_refine(objective, sub_task_results, filename, projectname, continuation=False):
     console.print("\nCalling Opus to provide the refined final output for your objective:")
@@ -84,7 +112,8 @@ def opus_refine(objective, sub_task_results, filename, projectname, continuation
         },
         {
             "role": "user",
-            "content": "Objective: " + objective + "\n\nSub-task results:\n" + "\n".join(sub_task_results) + "\n\nPlease review and refine the sub-task results into a cohesive final output. Add any missing information or details as needed. Make sure the code files are completed. When working on code projects, ONLY AND ONLY IF THE PROJECT IS CLEARLY A CODING ONE please provide the following:\n1. Project Name: Create a concise and appropriate project name that fits the project based on what it's creating. The project name should be no more than 20 characters long.\n2. Folder Structure: Provide the folder structure as a valid JSON object, where each key represents a folder or file, and nested keys represent subfolders. Use null values for files. Ensure the JSON is properly formatted without any syntax errors. Please make sure all keys are enclosed in double quotes, and ensure objects are correctly encapsulated with braces, separating items with commas as necessary.\nWrap the JSON object in <folder_structure> tags.\n3. Code Files: For each code file, include ONLY the file name in this format 'Filename: <filename>' NEVER EVER USE THE FILE PATH OR ANY OTHER FORMATTING YOU ONLY USE THE FOLLOWING format 'Filename: <filename>' followed by the code block enclosed in triple backticks, with the language identifier after the opening backticks, like this:\n\n​python\n<code>\n​"
+            "content": "Objective: " + objective + "\n\nSub-task results:\n" + "\n".join(
+                sub_task_results) + "\n\nPlease review and refine the sub-task results into a cohesive final output. Add any missing information or details as needed. Make sure the code files are completed. When working on code projects, ONLY AND ONLY IF THE PROJECT IS CLEARLY A CODING ONE please provide the following:\n1. Project Name: Create a concise and appropriate project name that fits the project based on what it's creating. The project name should be no more than 20 characters long.\n2. Folder Structure: Provide the folder structure as a valid JSON object, where each key represents a folder or file, and nested keys represent subfolders. Use null values for files. Ensure the JSON is properly formatted without any syntax errors. Please make sure all keys are enclosed in double quotes, and ensure objects are correctly encapsulated with braces, separating items with commas as necessary.\nWrap the JSON object in <folder_structure> tags.\n3. Code Files: For each code file, include ONLY the file name in this format 'Filename: <filename>' NEVER EVER USE THE FILE PATH OR ANY OTHER FORMATTING YOU ONLY USE THE FOLLOWING format 'Filename: <filename>' followed by the code block enclosed in triple backticks, with the language identifier after the opening backticks, like this:\n\n​python\n<code>\n​"
         }
     ]
 
@@ -95,20 +124,26 @@ def opus_refine(objective, sub_task_results, filename, projectname, continuation
     )
 
     response_text = opus_response.choices[0].message.content
-    console.print(Panel(response_text, title="[bold green]Final Output[/bold green]", title_align="left", border_style="green"))
+    console.print(
+        Panel(response_text, title="[bold green]Final Output[/bold green]", title_align="left", border_style="green"))
     return response_text
+
 
 def create_folder_structure(project_name, folder_structure, code_blocks):
     # Create the project folder
     try:
         os.makedirs(project_name, exist_ok=True)
-        console.print(Panel(f"Created project folder: [bold]{project_name}[/bold]", title="[bold green]Project Folder[/bold green]", title_align="left", border_style="green"))
+        console.print(Panel(f"Created project folder: [bold]{project_name}[/bold]",
+                            title="[bold green]Project Folder[/bold green]", title_align="left", border_style="green"))
     except OSError as e:
-        console.print(Panel(f"Error creating project folder: [bold]{project_name}[/bold]\nError: {e}", title="[bold red]Project Folder Creation Error[/bold red]", title_align="left", border_style="red"))
+        console.print(Panel(f"Error creating project folder: [bold]{project_name}[/bold]\nError: {e}",
+                            title="[bold red]Project Folder Creation Error[/bold red]", title_align="left",
+                            border_style="red"))
         return
 
     # Recursively create the folder structure and files
     create_folders_and_files(project_name, folder_structure, code_blocks)
+
 
 def create_folders_and_files(current_path, structure, code_blocks):
     for key, value in structure.items():
@@ -116,26 +151,38 @@ def create_folders_and_files(current_path, structure, code_blocks):
         if isinstance(value, dict):
             try:
                 os.makedirs(path, exist_ok=True)
-                console.print(Panel(f"Created folder: [bold]{path}[/bold]", title="[bold blue]Folder Creation[/bold blue]", title_align="left", border_style="blue"))
+                console.print(
+                    Panel(f"Created folder: [bold]{path}[/bold]", title="[bold blue]Folder Creation[/bold blue]",
+                          title_align="left", border_style="blue"))
                 create_folders_and_files(path, value, code_blocks)
             except OSError as e:
-                console.print(Panel(f"Error creating folder: [bold]{path}[/bold]\nError: {e}", title="[bold red]Folder Creation Error[/bold red]", title_align="left", border_style="red"))
+                console.print(Panel(f"Error creating folder: [bold]{path}[/bold]\nError: {e}",
+                                    title="[bold red]Folder Creation Error[/bold red]", title_align="left",
+                                    border_style="red"))
         else:
             code_content = next((code for file, code in code_blocks if file == key), None)
             if code_content:
                 try:
                     with open(path, 'w') as file:
                         file.write(code_content)
-                    console.print(Panel(f"Created file: [bold]{path}[/bold]", title="[bold green]File Creation[/bold green]", title_align="left", border_style="green"))
+                    console.print(
+                        Panel(f"Created file: [bold]{path}[/bold]", title="[bold green]File Creation[/bold green]",
+                              title_align="left", border_style="green"))
                 except IOError as e:
-                    console.print(Panel(f"Error creating file: [bold]{path}[/bold]\nError: {e}", title="[bold red]File Creation Error[/bold red]", title_align="left", border_style="red"))
+                    console.print(Panel(f"Error creating file: [bold]{path}[/bold]\nError: {e}",
+                                        title="[bold red]File Creation Error[/bold red]", title_align="left",
+                                        border_style="red"))
             else:
-                console.print(Panel(f"Code content not found for file: [bold]{key}[/bold]", title="[bold yellow]Missing Code Content[/bold yellow]", title_align="left", border_style="yellow"))
+                console.print(Panel(f"Code content not found for file: [bold]{key}[/bold]",
+                                    title="[bold yellow]Missing Code Content[/bold yellow]", title_align="left",
+                                    border_style="yellow"))
+
 
 def read_file(file_path):
     with open(file_path, 'r') as file:
         content = file.read()
     return content
+
 
 # Get the objective from user input
 objective = input("Please enter your objective with or without a text file path: ")
@@ -201,8 +248,12 @@ if folder_structure_match:
     try:
         folder_structure = json.loads(json_string)
     except json.JSONDecodeError as e:
-        console.print(Panel(f"Error parsing JSON: {e}", title="[bold red]JSON Parsing Error[/bold red]", title_align="left", border_style="red"))
-        console.print(Panel(f"Invalid JSON string: [bold]{json_string}[/bold]", title="[bold red]Invalid JSON String[/bold red]", title_align="left", border_style="red"))
+        console.print(
+            Panel(f"Error parsing JSON: {e}", title="[bold red]JSON Parsing Error[/bold red]", title_align="left",
+                  border_style="red"))
+        console.print(
+            Panel(f"Invalid JSON string: [bold]{json_string}[/bold]", title="[bold red]Invalid JSON String[/bold red]",
+                  title_align="left", border_style="red"))
 
 # Extract code files from the refined output
 code_blocks = re.findall(r'Filename: (\S+)\s*```[\w]*\n(.*?)\n```', refined_output, re.DOTALL)
