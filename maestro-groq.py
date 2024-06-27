@@ -9,7 +9,7 @@ import time
 from groq import Groq, RateLimitError
 import os
 
-client = Groq(api_key="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")
+client = Groq(api_key="")
 
 # Define the models to use for each agent
 ORCHESTRATOR_MODEL = "mixtral-8x7b-32768"
